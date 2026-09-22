@@ -1,8 +1,2 @@
-from fastapi import FastAPI
-
-app = FastAPI()
-
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+"""ASGI entrypoint. `uvicorn main:app` keeps serving the original root route."""
+from fleetapi.app import app  # noqa: F401
