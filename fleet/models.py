@@ -19,7 +19,9 @@ class StepState(str, Enum):
     PENDING -> DISPATCHED -> SUCCEEDED
                        \--> FAILED (不可恢复 / 重试耗尽)
     PENDING 在依赖未满足或派发被拒时保持 PENDING（带最近一次拒绝原因）。
-    PENDING/DISPATCHED --(任务取消或被抢占)--> CANCELLED（容量立即释放）。
+    DISPATCHED --(被高优先级抢占)--> PENDING（last_reject=PREEMPTED，
+    不算失败、不消耗重试次数，容量释放后等待重新派发）。
+    PENDING/DISPATCHED --(任务取消)--> CANCELLED（容量立即释放）。
     """
 
     PENDING = "PENDING"
@@ -45,14 +47,41 @@ class TaskState(str, Enum):
     CANCELLED = "CANCELLED"
 
 
+class Priority(str, Enum):
+    """任务优先级。提交时不携带则按 MEDIUM（普通）处理，与旧行为一致。
+
+    调度顺序：优先级高者先派；同优先级按提交先后（FIFO）。
+    高优先级步骤等容量时，可抢占（让位）严格更低优先级的在飞步骤。
+    """
+
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+    @property
+    def rank(self) -> int:
+        """数值越小优先级越高（用于排序与抢占比较）。"""
+        return _PRIORITY_RANK[self]
+
+
+_PRIORITY_RANK = {
+    Priority.HIGH: 0,
+    Priority.MEDIUM: 1,
+    Priority.LOW: 2,
+}
+
+
 class RejectReason(str, Enum):
-    """派发请求被拒绝的可区分原因。"""
+    """派发请求被拒绝/步骤回到 PENDING 的可区分原因。"""
 
     DEPENDENCY_NOT_MET = "DEPENDENCY_NOT_MET"
     CAPABILITY_MISMATCH = "CAPABILITY_MISMATCH"
     INSUFFICIENT_CAPACITY = "INSUFFICIENT_CAPACITY"
     TASK_NOT_ACTIVE = "TASK_NOT_ACTIVE"
     NO_CANDIDATE_UNIT = "NO_CANDIDATE_UNIT"
+    # 在飞步骤被更高优先级步骤抢占而让位：不算失败、不消耗重试次数，
+    # 容量释放后回到 PENDING 等待重新派发。
+    PREEMPTED = "PREEMPTED"
 
 
 class FailureCode(str, Enum):
@@ -82,10 +111,15 @@ class StepSpec:
 
 @dataclass(frozen=True)
 class TaskSpec:
-    """一次任务提交的声明。"""
+    """一次任务提交的声明。
+
+    priority: 任务级优先级（其所有步骤继承）。缺省 MEDIUM，
+              与未携带优先级的旧提交行为完全一致。
+    """
 
     task_id: str
     steps: tuple[StepSpec, ...]
+    priority: Priority = Priority.MEDIUM
 
 
 @dataclass
@@ -111,6 +145,8 @@ class StepView:
     capacity_cost: int
     attempts: int = 0
     max_retries: int = 0
+    retries_used: int = 0
+    preemptions: int = 0
     last_reject: RejectReason | None = None
     failure_code: FailureCode | None = None
     failure_detail: str = ""
@@ -126,6 +162,7 @@ class TaskView:
     state: TaskState
     steps: dict[str, StepView] = field(default_factory=dict)
     rejection: str = ""
+    priority: Priority = Priority.MEDIUM
 
 
 @dataclass

@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 
 from .errors import InvalidSpecError, UnknownTaskError
 from .executor import StepBehavior
-from .models import StepSpec, TaskSpec, UnitConfig
+from .models import Priority, StepSpec, TaskSpec, UnitConfig
 from .service import FleetService
 
 # 行为脚本中可识别的结果字面量
@@ -47,6 +47,9 @@ class StepIn(BaseModel):
 class SubmitIn(BaseModel):
     task_id: str
     steps: list[StepIn]
+    # 可选：任务优先级（high/medium/low）。不携带时按 medium（普通）处理，
+    # 与旧版请求的行为完全一致。
+    priority: Literal["high", "medium", "low"] = "medium"
 
 
 class UnitIn(BaseModel):
@@ -85,6 +88,7 @@ def create_app(service: FleetService | None = None) -> FastAPI:
         try:
             spec = TaskSpec(
                 task_id=body.task_id,
+                priority=Priority(body.priority),
                 steps=tuple(
                     StepSpec(
                         id=s.id,
@@ -180,6 +184,8 @@ def _step_payload(s) -> dict:
         "capacity_cost": s.capacity_cost,
         "attempts": s.attempts,
         "max_retries": s.max_retries,
+        "retries_used": s.retries_used,
+        "preemptions": s.preemptions,
         "last_reject": s.last_reject.value if s.last_reject else None,
         "failure_code": s.failure_code.value if s.failure_code else None,
         "failure_detail": s.failure_detail,
@@ -193,6 +199,7 @@ def _task_payload(view) -> dict:
         "task_id": view.task_id,
         "state": view.state.value,
         "rejection": view.rejection,
+        "priority": view.priority.value,
         "steps": [_step_payload(view.steps[sid]) for sid in view.steps],
     }
 

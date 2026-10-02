@@ -13,7 +13,7 @@ from __future__ import annotations
 from .engine import OrchestrationEngine
 from .errors import InvalidSpecError, UnknownTaskError
 from .executor import ExecutionUnit, StepBehavior, UnitRegistry
-from .models import StepSpec, TaskSpec, TaskView, UnitConfig
+from .models import Priority, StepSpec, TaskSpec, TaskView, UnitConfig
 from .store import InMemoryStore
 
 
@@ -48,6 +48,10 @@ class FleetService:
         """校验任务声明：步骤 id 唯一、依赖存在、DAG 无环、参数合法。"""
         if not spec.task_id:
             raise InvalidSpecError("task_id must be non-empty")
+        if not isinstance(spec.priority, Priority):
+            raise InvalidSpecError(
+                f"priority must be one of {[p.value for p in Priority]}"
+            )
         if not spec.steps:
             raise InvalidSpecError("task must contain at least one step")
         ids = [s.id for s in spec.steps]
@@ -106,7 +110,7 @@ class FleetService:
                     detail="duplicate submit ignored; returning existing task",
                 )
                 return self.store.snapshot_task(spec.task_id), False
-            self.store.create_task(spec.task_id, list(spec.steps))
+            self.store.create_task(spec.task_id, list(spec.steps), spec.priority)
             for step in spec.steps:
                 if step.id in behaviors:
                     self.engine.register_behavior(
@@ -114,7 +118,10 @@ class FleetService:
                     )
             self.engine.emit(
                 "submit", spec.task_id,
-                detail=f"accepted {len(spec.steps)} step(s)",
+                detail=(
+                    f"accepted {len(spec.steps)} step(s) "
+                    f"priority={spec.priority.value}"
+                ),
             )
         self.engine.kick()
         return self.store.snapshot_task(spec.task_id), True

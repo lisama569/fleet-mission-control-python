@@ -2,18 +2,23 @@
 
 职责
 ----
-1. 调度：按任务提交顺序（FIFO）+ 步骤声明顺序推进；每次推进在
-   store 全局锁的临界区内完成"依赖检查 -> 能力/容量筛选 -> 容量占用
-   -> 状态流转"，并发提交下约束与派发顺序都不会被突破。
-2. 执行：把一次尝试提交到线程池，在执行单元上同步跑行为脚本；
+1. 调度：按 (任务优先级, 提交序号) 排序推进——高优先级先派、同优先级
+   FIFO，任务内步骤按声明顺序；每次推进在 store 全局锁的临界区内完成
+   "依赖检查 -> 能力/容量筛选 -> (必要时抢占让位) -> 容量占用 -> 状态流转"，
+   并发提交下约束与派发顺序都不会被突破。
+2. 抢占：高优先级步骤等容量时，让严格更低优先级的在飞步骤让位
+   （PREEMPTED，不算失败、不消耗重试额度），容量立即转交；让位/重派
+   不改变任务的 (优先级, 提交序号)，顺序稳定可复现。
+3. 执行：把一次尝试提交到线程池，在执行单元上同步跑行为脚本；
    以 watchdog 定时器实现超时语义（不依赖真实 sleep 的脚本结果）。
-3. 重试：超时/异常退出属可恢复错误，未超过 max_retries 则释放容量、
-   回到 PENDING 重新派发；重试耗尽 -> FAILED(RETRIES_EXHAUSTED)；
+4. 重试：超时/异常退出属可恢复错误，retries_used 未达 max_retries 则
+   释放容量、回到 PENDING 重新派发；耗尽 -> FAILED(RETRIES_EXHAUSTED)；
    不可恢复错误 -> FAILED(NON_RECOVERABLE)。
-4. 回收：任务取消（含抢占）与执行单元离线时，所有被占用容量立即释放，
-   飞行中尝试的迟到结果按"状态 + 尝试代次"守卫丢弃，杜绝悬空占用。
-5. 幂等：已完成的副作用只在成功收口时计一次；成功即终态，不会重放。
-6. 事件：每次关键判定都记录 EngineEvent，测试中打印输入事件与判定依据。
+5. 回收：任务取消、任务进入终态（级联停掉在飞步骤）与执行单元离线时，
+   所有被占用容量立即释放，飞行中尝试的迟到结果按"状态 + 尝试代次"
+   守卫丢弃，杜绝悬空占用与终态后视图变更。
+6. 幂等：已完成的副作用只在成功收口时计一次；成功即终态，不会重放。
+7. 事件：每次关键判定都记录 EngineEvent，测试中打印输入事件与判定依据。
 """
 
 from __future__ import annotations
@@ -59,6 +64,7 @@ class OrchestrationEngine:
         )
         self._tick_guard = threading.Lock()   # 串行化调度，保证派发顺序确定
         self._seq = 0
+        self._dispatch_seq = 0                # 全局派发序号（抢占选 victim 用）
         self._behaviors: dict[tuple[str, str], StepBehavior] = {}
 
     # ---------------- 事件日志 ----------------
@@ -110,8 +116,9 @@ class OrchestrationEngine:
     def kick(self) -> None:
         """触发一次调度扫描（提交/结果到达/离线后调用）。
 
-        用非重入锁保证全局同时只有一次扫描，派发顺序按 task_id 排序，
-        步骤按声明顺序；同一 tick 内尽量派发所有当前可派发步骤。
+        用非重入锁保证全局同时只有一次扫描。派发顺序确定、可复现：
+        任务按 (优先级, 提交序号) 排序——高优先级先派，同优先级 FIFO；
+        任务内步骤按声明顺序；同一 tick 内尽量派发所有当前可派发步骤。
         """
         if not self._tick_guard.acquire(blocking=False):
             return
@@ -120,7 +127,7 @@ class OrchestrationEngine:
             # 无可派发步骤（全部等待/拒绝/终态）时退出。
             while True:
                 any_dispatch = False
-                for task_id in sorted(self.store.list_tasks()):
+                for task_id in self.store.ordered_task_ids():
                     if self._try_dispatch(task_id):
                         any_dispatch = True
                 if not any_dispatch:
@@ -170,6 +177,38 @@ class OrchestrationEngine:
                     if u.free_capacity() >= spec.capacity_cost
                 ]
                 if not fitting:
+                    # 容量不足：若本步骤优先级高于某些在飞步骤，尝试抢占让位。
+                    # 整个"筛选 victim -> 让位 -> 占用 -> 派发"在同一临界区完成，
+                    # 并发提交/取消/离线不会超卖容量，账目也不会对不上。
+                    plan = self._plan_preemption(
+                        capable, spec.capacity_cost,
+                        self.store.priority_rank(task_id),
+                    )
+                    if plan is not None:
+                        unit, victims = plan
+                        for vt, vs, vcost in victims:
+                            freed = self.store.preempt_step(
+                                vt, vs,
+                                f"preempted by higher-priority "
+                                f"task={task_id} step={spec.id}",
+                            )
+                            if freed is None:
+                                continue  # 已被并发路径让位（防御，正常不会发生）
+                            self._release(
+                                unit.unit_id, freed,
+                                f"preempted task={vt} step={vs} "
+                                f"by task={task_id} step={spec.id}",
+                            )
+                            self._emit(
+                                "preempt", vt, vs, unit.unit_id,
+                                reason=RejectReason.PREEMPTED.value,
+                                detail=(
+                                    f"yields to task={task_id} step={spec.id} "
+                                    f"(priority={self.store.task_priority(task_id).value})"
+                                ),
+                            )
+                        fitting = [unit]
+                if not fitting:
                     reason = RejectReason.INSUFFICIENT_CAPACITY
                     detail = (
                         f"capable units {[u.unit_id for u in capable]} lack "
@@ -183,8 +222,9 @@ class OrchestrationEngine:
                         detail = f"capacity lost on unit {unit.unit_id}"
                         fitting = []  # fall through to reject path
                     else:
+                        self._dispatch_seq += 1
                         attempt = self.store.mark_dispatched(
-                            task_id, spec.id, unit.unit_id
+                            task_id, spec.id, unit.unit_id, self._dispatch_seq
                         )
                         behavior = self._behaviors.get(
                             (task_id, spec.id), StepBehavior()
@@ -193,6 +233,7 @@ class OrchestrationEngine:
                             "dispatch", task_id, spec.id, unit.unit_id,
                             detail=(
                                 f"attempt={attempt} cost={spec.capacity_cost} "
+                                f"priority={self.store.task_priority(task_id).value} "
                                 f"free_after={unit.free_capacity()}/"
                                 f"{unit.capacity}"
                             ),
@@ -207,6 +248,44 @@ class OrchestrationEngine:
             self.store.record_rejection(task_id, spec.id, reason)
             self._emit("reject", task_id, spec.id, reason=reason.value, detail=detail)
             return False
+
+    # ---------------- 抢占规划 ----------------
+    def _plan_preemption(
+        self, capable: list, cost: int, waiting_rank: int
+    ):
+        """为等容量的高优先级步骤规划抢占。须在 store.lock 临界区内调用。
+
+        规则（确定、可复现）：
+        - 只抢占优先级**严格更低**（rank 数值更大）的在飞步骤；同优先级不让位；
+        - 每个单元上按 (优先级从低到高, 派发序号从晚到早) 的顺序选 victim，
+          直到腾出足够容量；选不出则该单元不参与；
+        - 在可行单元中选 victim 最少、其次 unit_id 最小者。
+        返回 (unit, [(task_id, step_id, cost), ...]) 或 None。
+        """
+        best = None
+        for unit in sorted(capable, key=lambda u: u.unit_id):
+            free = unit.free_capacity()
+            candidates = [
+                iv for iv in self.store.inflight_on_unit(unit.unit_id)
+                if iv[3] > waiting_rank  # iv[3]=victim 优先级 rank，严格更低才让位
+            ]
+            # 最低优先级、最晚派发的先让位
+            candidates.sort(key=lambda iv: (-iv[3], -iv[4]))
+            victims: list[tuple[str, str, int]] = []
+            gained = free
+            for iv in candidates:
+                if gained >= cost:
+                    break
+                victims.append((iv[0], iv[1], iv[2]))
+                gained += iv[2]
+            if gained < cost:
+                continue
+            key = (len(victims), unit.unit_id)
+            if best is None or key < best[0]:
+                best = (key, unit, victims)
+        if best is None:
+            return None
+        return best[1], best[2]
 
     # ---------------- 执行与结果收口 ----------------
     def _run_attempt(
@@ -324,6 +403,23 @@ class OrchestrationEngine:
             self._release(unit_id, cost, "step succeeded")
         self.kick()
 
+    def _cascade_terminal(self, task_id: str) -> None:
+        """任务进入终态后回收仍在飞步骤的占用（须在 store.lock 临界区内调用）。
+
+        保证"任务终态 => 无在飞步骤"：在飞步骤置 CANCELLED 并释放容量，
+        其迟到结果会被状态/代次守卫丢弃，不计副作用、不改变对外视图。
+        """
+        for sid, uid, cost in self.store.cascade_terminal_inflight(task_id):
+            self._release(
+                uid, cost,
+                f"task terminal; cancelled in-flight task={task_id} step={sid}",
+            )
+            self._emit(
+                "cancel_inflight", task_id, sid, uid,
+                reason="TASK_TERMINAL",
+                detail="task reached terminal state; in-flight step cancelled",
+            )
+
     def _finish_non_recoverable(
         self, task_id, step_id, unit_id, attempt, cost, detail
     ) -> None:
@@ -347,6 +443,8 @@ class OrchestrationEngine:
                     "fail", task_id, step_id, unit_id,
                     reason=FailureCode.NON_RECOVERABLE.value, detail=detail,
                 )
+                # 任务因此进入 FAILED 终态：级联停掉同任务其它在飞步骤
+                self._cascade_terminal(task_id)
             else:
                 self._emit(
                     "stale", task_id, step_id, unit_id,
@@ -367,20 +465,10 @@ class OrchestrationEngine:
                     outcome=outcome, detail=detail,
                 ),
             )
-            will_retry = attempt < max_retries
-            accepted = False
-            if will_retry:
-                accepted = self.store.revert_to_pending(
-                    task_id, step_id,
-                    f"{detail}; retry {attempt + 1}/{max_retries}",
-                    attempt,
-                )
-            else:
-                accepted = self.store.mark_failed(
-                    task_id, step_id, FailureCode.RETRIES_EXHAUSTED,
-                    f"{detail}; retries exhausted after {attempt + 1} attempt(s)",
-                    attempt,
-                )
+            # 重试额度按 retries_used 计：抢占/离线让位不消耗额度
+            accepted, will_retry = self.store.finish_recoverable(
+                task_id, step_id, detail, attempt, max_retries
+            )
             if accepted:
                 self._release(
                     unit_id, cost,
@@ -396,7 +484,7 @@ class OrchestrationEngine:
                 self._emit(
                     "retry", task_id, step_id, unit_id,
                     reason=outcome,
-                    detail=f"{detail}; scheduling retry {attempt + 1}/{max_retries}",
+                    detail=f"{detail}; retry scheduled (max_retries={max_retries})",
                 )
             elif accepted:
                 self._emit(
@@ -404,6 +492,8 @@ class OrchestrationEngine:
                     reason=FailureCode.RETRIES_EXHAUSTED.value,
                     detail=f"{detail}; exhausted after {attempt + 1} attempt(s)",
                 )
+                # 任务因此进入 FAILED 终态：级联停掉同任务其它在飞步骤
+                self._cascade_terminal(task_id)
         self.kick()
 
     # ---------------- 取消 / 离线 ----------------
