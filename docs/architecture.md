@@ -26,22 +26,67 @@ HTTP 层     │ fleet/api.py (FastAPI 路由)   │  GET / 保持原样
 - **engine** 拥有线程池与超时看门狗，所有状态流转都在 store 锁临界区内调用；
   执行（可能 sleep/delay）在锁外的线程池中进行，只有"结果收口"时短暂持锁。
 
-## 2. 派发的原子性
+## 2. 派发的原子性与顺序
+
+### 2.1 派发顺序（可预期、可复现）
+
+全局调度顺序固定为两级排序：
+
+1. **优先级降序**：`HIGH(3) > NORMAL(2) > LOW(1)`；
+2. **同优先级按提交序号 `submit_seq` 升序**：先来先服务（FCFS）。
+
+`submit_seq` 是提交临界区内分配的全局单调递增整数，**抢占重排不改变它**。
+因此"谁先派、谁后派"完全由 `(priority, submit_seq)` 决定，与线程调度无关，
+可通过 `GET /tasks`（响应含 `priority`、`submit_seq`）与有序引擎事件
+（`submit/dispatch/preempt/preempted/reject`）逐条复核。
+
+### 2.2 一次派发
 
 一次派发 `_try_dispatch` 在 `store.lock` 内完成：
 
-1. `store.dispatchable`：按声明顺序找第一个 `PENDING` 步骤并检查依赖
+1. `store.dispatchable`：按声明顺序找第一个待派发步骤
+   （`PENDING` 或 `PREEMPTED`）并检查依赖
    （依赖必须全部 `SUCCEEDED`），否则记录 `DEPENDENCY_NOT_MET`；
-2. 在同一临界区内枚举在线单元，区分：
+2. 在同一临界区内枚举在线单元（按 `unit_id` 升序，确定），区分：
    - 无在线单元 → `NO_CANDIDATE_UNIT`；
    - 无能力匹配 → `CAPABILITY_MISMATCH`；
-   - 能力匹配但容量都不足 → `INSUFFICIENT_CAPACITY`；
+   - 能力匹配但容量都不足 → 先尝试抢占（见 §2.3），仍不足才
+     `INSUFFICIENT_CAPACITY`；
 3. 选定剩余容量足够、`unit_id` 最小的单元（确定性），调用
    `unit.acquire` 原子占用；随后 `mark_dispatched` 状态流转并提交线程池。
 
-"检查 + 占用"同锁完成，因此并发提交下不会出现超卖（容量被两个派发同时
-看到并占用）。引擎另有非重入的 `_tick_guard`：任意时刻只有一次调度扫描，
-配合任务按 `task_id` 排序，保证竞争窗口内派发顺序确定、可复现。
+"检查 + 抢占 + 占用"同锁完成，因此并发提交下不会出现超卖（容量被两个派发
+同时看到并占用）。引擎另有非重入的 `_tick_guard`：任意时刻只有一次调度
+扫描，配合 `(priority, submit_seq)` 排序，竞争窗口内派发顺序确定、可复现。
+
+### 2.3 优先级抢占（让位）
+
+当某个具备所需能力的在线单元剩余容量不足时，引擎在**同一临界区**内尝试让
+该单元上**优先级严格更低**的在飞步骤让位：
+
+- 候选单元按 `unit_id` 升序，选择第一个能凑出 `capacity_cost` 的单元；
+- 每个单元上的牺牲品按"**优先级最低优先；同级后派发先让位
+  （`dispatch_seq` 大的先让）**"顺序累加，直到腾出容量 `>= cost`；
+- **同优先级互不相让**：只有严格更高优先级才能抢占，同级始终排队 FCFS。
+
+被让出的步骤经历 `DISPATCHED -> PREEMPTED`：
+
+| 语义维度 | 行为 |
+|----------|------|
+| 是否失败 | **不是失败**。不进 `FAILED`，无 `failure_code` |
+| 重试次数 | **不消耗重试额度**：`retry_count` 不增加，让位重跑等价于被让出前那次执行 |
+| 让位原因 | `last_preempt_reason = PREEMPT_FOR_HIGHER_PRIORITY`（可区分、可查询），`preempt_count += 1` |
+| 容量 | 在同一临界区内立即释放并交给高优先级步骤占用（不超卖） |
+| 旧飞行结果 | 派发代次 `attempts`（epoch）在重派时 +1；旧代次的僵尸结果（成功/失败/超时）一律被代次守卫丢弃 |
+| 后续 | 步骤保留在 `PREEMPTED`，下一轮 `kick` 自动重新派发；保留原始 `submit_seq`，重排顺序仍稳定 |
+| 副作用 | 只有最终成功收口（恰一次）才计数；旧派发即便迟到"成功"也不计入 |
+
+派发线程池入参区分两个序号：`epoch`（派发代次，用于结果守卫）与
+`script_attempt`（可恢复失败次数，供行为脚本选结果）。抢占重派时
+`epoch + 1` 而 `script_attempt` 不变，这正是"让位不消耗重试"的实现点。
+
+抢占事件成对出现：`preempt`（高优先级步骤）与 `preempted`（每个牺牲品，
+含原因与"not a failure, no retry consumed"说明）。
 
 ## 3. 执行、超时与结果收口
 
@@ -49,11 +94,18 @@ HTTP 层     │ fleet/api.py (FastAPI 路由)   │  GET / 保持原样
   同时启动一个 daemon 看门狗线程，`Event.wait(timeout)` 到时未完成即按
   **超时**走可恢复收口。
 - 收口路径（成功 / 可恢复 / 不可恢复）都在 store 锁内执行，且带
-  **尝试代次守卫**：仅当步骤仍为 `DISPATCHED` 且 `attempts == attempt+1`
-  时结果才被接受。超时后的"迟到成功"、取消后的迟到结果都会被丢弃。
+  **派发代次守卫**：仅当步骤仍为 `DISPATCHED` 且 `attempts == epoch`
+  时结果才被接受。超时后的"迟到成功"、取消后的迟到结果、**让位抢占后旧
+  派发的僵尸结果**都会被丢弃（记录 `stale` 事件）。
 - 看门狗与工作线程可能同时尝试收口：代次守卫使第二个收口成为 no-op；
   容量释放统一走 `_release`，与状态收口在同一临界区，保证一次占用恰好
   释放一次（`ExecutionUnit.release` 还有超额释放断言兜底）。
+- **任务终态自洽**：步骤进入 `FAILED` 终态的同一临界区内，同任务其余
+  已经开始但未终态的步骤（在飞 `DISPATCHED`、让位中 `PREEMPTED`）一并
+  置 `CANCELLED` 并释放占用（`cancel_sibling` 事件）。任务进入
+  `FAILED/CANCELLED` 后，`dispatchable` 对其一律返回 `TASK_NOT_ACTIVE`，
+  因此任何迟到结果都不可能再让步骤成功、计数或改变对外视图；从未派发的
+  `PENDING` 步骤保持 PENDING（依赖已不可能满足，任务不会再调度）。
 
 ## 4. 容量生命周期（无悬空占用）
 
@@ -63,9 +115,10 @@ HTTP 层     │ fleet/api.py (FastAPI 路由)   │  GET / 保持原样
 |--------------|----------------------------------------------------------------------|
 | 成功         | `mark_succeeded` + `release`                                         |
 | 可恢复失败   | 有额度：回 `PENDING` + `release`，后续重新派发再占用                  |
-| 重试耗尽     | `FAILED/RETRIES_EXHAUSTED` + `release`                               |
-| 不可恢复     | `FAILED/NON_RECOVERABLE` + `release`（不重试）                        |
-| 任务取消/抢占 | 所有未终态步骤置 `CANCELLED`，在飞占用立即 `release`；迟到结果丢弃     |
+| 重试耗尽     | `FAILED/RETRIES_EXHAUSTED` + `release`，并取消同任务在飞兄弟步骤       |
+| 不可恢复     | `FAILED/NON_RECOVERABLE` + `release`（不重试），并取消同任务在飞兄弟   |
+| 让位抢占     | `DISPATCHED -> PREEMPTED` + 立即 `release`，同临界区交给高优先级步骤   |
+| 任务取消/终态 | 所有未完成步骤置 `CANCELLED`，在飞占用立即 `release`；迟到结果丢弃     |
 | 单元离线     | `mark_offline` + 在飞步骤回 `PENDING` + 释放其占用，重派到其它单元     |
 
 每次释放都产生 `release` 事件（含释放后剩余容量），测试用
@@ -76,12 +129,19 @@ HTTP 层     │ fleet/api.py (FastAPI 路由)   │  GET / 保持原样
 - 提交在 store 锁内完成「检查 `task_id` 是否已存在 → 创建任务/注册行为」，
   并发重复提交只有一个线程走创建分支；其余返回同一快照、`created=false`。
 - 重复提交携带的新声明/新行为被忽略，因此不会产生重复步骤或重复执行。
-- 成功副作用仅在成功收口累加一次；重试链路上的失败尝试 `side_effect_count=0`。
+- 成功副作用仅在成功收口累加一次；重试链路上的失败尝试 `side_effect_count=0`；
+  让位重跑时旧派发的迟到成功被丢弃，副作用不会因重跑而重复统计。
+- 优先级不参与幂等键：重复提交以 `task_id` 命中即忽略后续内容
+  （包括第二次携带的不同 priority），语义不变。
 
 ## 6. 可观测性与可复现
 
 - 所有关键判定产生有序 `EngineEvent(seq, kind, ...)` 并以 INFO 日志打印，
-  字段包括任务/步骤/单元、拒绝原因或失败码、尝试序号、释放前后容量。
+  字段包括任务/步骤/单元、**优先级 `prio`**、拒绝原因或失败码、派发代次
+  与脚本序号、释放前后容量。
+- 抢占场景产生成对事件 `preempt` / `preempted`（含让位原因
+  `PREEMPT_FOR_HIGHER_PRIORITY` 与"not a failure, no retry consumed"），
+  任务失败连带取消在飞步骤时产生 `cancel_sibling`。
 - 行为脚本把"时间/故障"变成纯数据：同一组 `outcomes/delay/timeout`
   在任意机器上跑出相同的尝试次数、终态与失败原因，单测因此可复现。
 

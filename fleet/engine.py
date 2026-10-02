@@ -36,6 +36,7 @@ from .models import (
     AttemptRecord,
     EngineEvent,
     FailureCode,
+    PreemptReason,
     RejectReason,
     StepState,
     TaskState,
@@ -50,10 +51,13 @@ class OrchestrationEngine:
         self,
         store: InMemoryStore,
         registry: UnitRegistry,
-        max_workers: int = 16,
+        max_workers: int = 32,
     ) -> None:
         self.store = store
         self.registry = registry
+        # 线程池只承载"执行尝试"（看门狗是独立 daemon 线程，不占池）。
+        # 留足并发余量：抢占/并发提交下多个在飞步骤同时收口时，
+        # 重派不会因为池满排队而被高负载放大为调度延迟。
         self._pool = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="fleet-exec"
         )
@@ -70,9 +74,10 @@ class OrchestrationEngine:
         unit_id: str = "",
         reason: str = "",
         detail: str = "",
+        priority: str = "",
     ) -> EngineEvent:
         """记录一条引擎判定事件（公开入口）。"""
-        return self._emit(kind, task_id, step_id, unit_id, reason, detail)
+        return self._emit(kind, task_id, step_id, unit_id, reason, detail, priority)
 
     def _emit(
         self,
@@ -82,6 +87,7 @@ class OrchestrationEngine:
         unit_id: str = "",
         reason: str = "",
         detail: str = "",
+        priority: str = "",
     ) -> EngineEvent:
         with self.store.lock:
             self._seq += 1
@@ -93,11 +99,12 @@ class OrchestrationEngine:
                 unit_id=unit_id,
                 reason=reason,
                 detail=detail,
+                priority=priority,
             )
         logger.info(
-            "event#%s %s task=%s step=%s unit=%s reason=%s detail=%s",
+            "event#%s %s task=%s step=%s unit=%s prio=%s reason=%s detail=%s",
             ev.seq, ev.kind, ev.task_id, ev.step_id, ev.unit_id,
-            ev.reason, ev.detail,
+            ev.priority, ev.reason, ev.detail,
         )
         return ev
 
@@ -110,8 +117,10 @@ class OrchestrationEngine:
     def kick(self) -> None:
         """触发一次调度扫描（提交/结果到达/离线后调用）。
 
-        用非重入锁保证全局同时只有一次扫描，派发顺序按 task_id 排序，
-        步骤按声明顺序；同一 tick 内尽量派发所有当前可派发步骤。
+        用非重入锁保证全局同时只有一次扫描；任务扫描顺序固定为
+        "优先级降序、同优先级按提交序号升序（FCFS）"，步骤按声明顺序；
+        同一 tick 内尽量派发所有当前可派发步骤。被抢占让回 PREEMPTED 的
+        步骤仍保留其原始 submit_seq，因此重排后顺序稳定、可复现。
         """
         if not self._tick_guard.acquire(blocking=False):
             return
@@ -120,7 +129,7 @@ class OrchestrationEngine:
             # 无可派发步骤（全部等待/拒绝/终态）时退出。
             while True:
                 any_dispatch = False
-                for task_id in sorted(self.store.list_tasks()):
+                for task_id in self.store.list_tasks_ordered():
                     if self._try_dispatch(task_id):
                         any_dispatch = True
                 if not any_dispatch:
@@ -148,8 +157,9 @@ class OrchestrationEngine:
                 return False
 
             spec = step.spec
+            priority = self.store.get_priority(task_id)
             # 能力/容量筛选（在 store 临界区内调用，保证检查与占用原子）
-            units = self.registry.all_units()
+            units = sorted(self.registry.all_units(), key=lambda u: u.unit_id)
             online = [u for u in units if u.is_online()]
             capable = [
                 u for u in online if spec.required_capability in u.capabilities
@@ -169,44 +179,127 @@ class OrchestrationEngine:
                     u for u in capable
                     if u.free_capacity() >= spec.capacity_cost
                 ]
-                if not fitting:
+                # 先直接使用空闲容量（unit_id 最小，确定性）
+                unit = min(fitting, key=lambda u: u.unit_id) if fitting else None
+                # 容量不足：在同一临界区内尝试抢占让出
+                if unit is None:
+                    unit, _victims = self._preempt_for(
+                        task_id, spec.id, priority,
+                        spec.required_capability, spec.capacity_cost, capable,
+                    )
+                if unit is None:
                     reason = RejectReason.INSUFFICIENT_CAPACITY
                     detail = (
                         f"capable units {[u.unit_id for u in capable]} lack "
                         f"capacity {spec.capacity_cost}; "
-                        f"free={ {u.unit_id: u.free_capacity() for u in capable} }"
+                        f"free={ {u.unit_id: u.free_capacity() for u in capable} }; "
+                        f"not enough strictly-lower-priority in-flight steps to preempt"
                     )
+                elif not unit.acquire(spec.required_capability, spec.capacity_cost):
+                    reason = RejectReason.INSUFFICIENT_CAPACITY
+                    detail = f"capacity lost on unit {unit.unit_id}"
                 else:
-                    unit = min(fitting, key=lambda u: u.unit_id)
-                    if not unit.acquire(spec.required_capability, spec.capacity_cost):
-                        reason = RejectReason.INSUFFICIENT_CAPACITY
-                        detail = f"capacity lost on unit {unit.unit_id}"
-                        fitting = []  # fall through to reject path
-                    else:
-                        attempt = self.store.mark_dispatched(
-                            task_id, spec.id, unit.unit_id
-                        )
-                        behavior = self._behaviors.get(
-                            (task_id, spec.id), StepBehavior()
-                        )
-                        self._emit(
-                            "dispatch", task_id, spec.id, unit.unit_id,
-                            detail=(
-                                f"attempt={attempt} cost={spec.capacity_cost} "
-                                f"free_after={unit.free_capacity()}/"
-                                f"{unit.capacity}"
-                            ),
-                        )
-                        self._pool.submit(
-                            self._run_attempt, task_id, spec.id,
-                            unit.unit_id, attempt, spec.timeout,
-                            spec.max_retries, spec.capacity_cost, behavior,
-                        )
-                        return True
+                    epoch = self.store.mark_dispatched(
+                        task_id, spec.id, unit.unit_id
+                    )
+                    _, retry_count = self.store.get_dispatch_identity(
+                        task_id, spec.id
+                    )
+                    behavior = self._behaviors.get(
+                        (task_id, spec.id), StepBehavior()
+                    )
+                    self._emit(
+                        "dispatch", task_id, spec.id, unit.unit_id,
+                        detail=(
+                            f"epoch={epoch} script_attempt={retry_count} "
+                            f"cost={spec.capacity_cost} "
+                            f"free_after={unit.free_capacity()}/{unit.capacity}"
+                        ),
+                        priority=priority.value,
+                    )
+                    self._pool.submit(
+                        self._run_attempt, task_id, spec.id,
+                        unit.unit_id, epoch, retry_count, spec.timeout,
+                        spec.max_retries, spec.capacity_cost, behavior,
+                    )
+                    return True
 
             self.store.record_rejection(task_id, spec.id, reason)
-            self._emit("reject", task_id, spec.id, reason=reason.value, detail=detail)
+            self._emit(
+                "reject", task_id, spec.id, reason=reason.value,
+                detail=detail, priority=priority.value,
+            )
             return False
+
+    def _preempt_for(
+        self,
+        task_id: str,
+        step_id: str,
+        priority,
+        capability: str,
+        cost: int,
+        capable_units: list,
+    ) -> tuple[object | None, list[tuple[str, str]]]:
+        """容量不足时，让候选单元上严格更低优先级的在飞步骤让位。
+
+        规则（与文档一致，完全确定）：
+        - 候选单元按 unit_id 升序，选择第一个能凑出 cost 的单元；
+        - 每个单元上的牺牲品按"优先级最低优先、同级后派发先让位"选取，
+          顺序累加容量直到 >= cost；只让位给严格更高优先级，同级互不相让；
+        - 状态置 PREEMPTED（不是失败、不消耗重试额度）、容量立即释放，
+          调用方随后在同一临界区占用该容量并派发高优先级步骤；
+        - 被让出步骤保留原始 submit_seq，下一轮 tick 自动重新派发，
+          重排顺序仍为"高优先级优先、同级 FCFS"。
+        所有状态流转都已在 store 锁内；返回 (选中的单元, 牺牲品列表)，
+        无单元可凑足时返回 (None, [])。
+        """
+        for u in capable_units:
+            meta = self.store.preempt_victims_on(u.unit_id, priority.rank)
+            chosen: list[tuple[str, str]] = []
+            freed = 0
+            for vtid, vsid, vcost, _rank, _seq in meta:
+                if freed >= cost:
+                    break
+                chosen.append((vtid, vsid))
+                freed += vcost
+            if freed < cost:
+                continue
+            why = (
+                f"preempted for {task_id}/{step_id} priority={priority.value} "
+                f"needing cost {cost} on unit {u.unit_id}"
+            )
+            released = self.store.preempt_steps(
+                chosen,
+                PreemptReason.PREEMPT_FOR_HIGHER_PRIORITY,
+                why,
+            )
+            for vtid, vsid, vunit, vcost in released:
+                self._release(
+                    vunit, vcost,
+                    f"preempted for higher-priority {task_id}/{step_id} "
+                    f"(victim {vtid}/{vsid})",
+                )
+                self._emit(
+                    "preempted", vtid, vsid, u.unit_id,
+                    reason=PreemptReason.PREEMPT_FOR_HIGHER_PRIORITY.value,
+                    detail=(
+                        f"yielded capacity to {task_id}/{step_id} "
+                        f"({priority.value}); not a failure, no retry consumed; "
+                        f"will auto-redispatch in FCFS order"
+                    ),
+                    priority=self.store.get_priority(vtid).value,
+                )
+            self._emit(
+                "preempt", task_id, step_id, u.unit_id,
+                reason=PreemptReason.PREEMPT_FOR_HIGHER_PRIORITY.value,
+                detail=(
+                    f"evicted {len(released)} strictly-lower-priority in-flight "
+                    f"step(s); freed={freed} needed={cost}"
+                ),
+                priority=priority.value,
+            )
+            return u, chosen
+        return None, []
 
     # ---------------- 执行与结果收口 ----------------
     def _run_attempt(
@@ -214,12 +307,19 @@ class OrchestrationEngine:
         task_id: str,
         step_id: str,
         unit_id: str,
-        attempt: int,
+        epoch: int,
+        script_attempt: int,
         timeout: float,
         max_retries: int,
         cost: int,
         behavior: StepBehavior,
     ) -> None:
+        """执行一次在飞派发。
+
+        epoch: 派发代次（首次=1），让位/取消/离线后旧代次结果被丢弃；
+        script_attempt: 行为脚本的结果序号（= 可恢复失败次数），
+        抢占重跑时该值不变（仍是被让出前的执行序号），不消耗重试额度。
+        """
         unit = self.registry.get(unit_id)
         outcome = OUT_CRASHED
         side_effects = 0
@@ -232,21 +332,21 @@ class OrchestrationEngine:
                 timed_out["v"] = True
                 self._emit(
                     "timeout", task_id, step_id, unit_id,
-                    detail=f"attempt={attempt} exceeded timeout {timeout}s",
+                    detail=f"epoch={epoch} exceeded timeout {timeout}s",
                 )
                 self._finish_recoverable(
-                    task_id, step_id, unit_id, attempt, cost,
+                    task_id, step_id, unit_id, epoch, script_attempt, cost,
                     max_retries, OUT_TIMEOUT,
                     f"timed out after {timeout}s",
                 )
 
         watcher = threading.Thread(
-            target=_watchdog, name=f"fleet-watchdog-{step_id}-{attempt}",
+            target=_watchdog, name=f"fleet-watchdog-{step_id}-{epoch}",
             daemon=True,
         )
         watcher.start()
         try:
-            side_effects = unit.run(step_id, attempt, behavior)
+            side_effects = unit.run(step_id, script_attempt, behavior)
             outcome = OUT_SUCCEEDED
         except RecoverableExecError as exc:
             outcome = OUT_TIMEOUT if "timed out" in str(exc) else OUT_CRASHED
@@ -267,15 +367,15 @@ class OrchestrationEngine:
 
         if outcome == OUT_SUCCEEDED:
             self._finish_success(
-                task_id, step_id, unit_id, attempt, cost, side_effects
+                task_id, step_id, unit_id, epoch, cost, side_effects
             )
         elif outcome == OUT_ERROR:
             self._finish_non_recoverable(
-                task_id, step_id, unit_id, attempt, cost, detail
+                task_id, step_id, unit_id, epoch, cost, detail
             )
         else:
             self._finish_recoverable(
-                task_id, step_id, unit_id, attempt, cost,
+                task_id, step_id, unit_id, epoch, script_attempt, cost,
                 max_retries, outcome, detail,
             )
 
@@ -293,23 +393,23 @@ class OrchestrationEngine:
         )
 
     def _finish_success(
-        self, task_id, step_id, unit_id, attempt, cost, side_effects
+        self, task_id, step_id, unit_id, epoch, cost, side_effects
     ) -> None:
         with self.store.lock:
             accepted = self.store.mark_succeeded(
-                task_id, step_id, side_effects, attempt
+                task_id, step_id, side_effects, epoch
             )
             self.store.record_attempt(
                 task_id,
                 AttemptRecord(
-                    step_id=step_id, attempt=attempt, unit_id=unit_id,
+                    step_id=step_id, attempt=epoch - 1, unit_id=unit_id,
                     outcome=OUT_SUCCEEDED, side_effect_count=side_effects
                     if accepted else 0,
                     detail="" if accepted else "stale result discarded",
                 ),
             )
             if not accepted:
-                # 抢占（取消/离线/超时重派）已释放过容量并移交了步骤归属，
+                # 让位抢占（取消/离线/超时重派）已释放过容量并移交了步骤归属，
                 # 迟到结果不得再次触碰容量账本，否则会造成超额/悬空释放。
                 self._emit(
                     "stale", task_id, step_id, unit_id,
@@ -319,22 +419,22 @@ class OrchestrationEngine:
                 return
             self._emit(
                 "success", task_id, step_id, unit_id,
-                detail=f"attempt={attempt} side_effects={side_effects}",
+                detail=f"epoch={epoch} side_effects={side_effects}",
             )
             self._release(unit_id, cost, "step succeeded")
         self.kick()
 
     def _finish_non_recoverable(
-        self, task_id, step_id, unit_id, attempt, cost, detail
+        self, task_id, step_id, unit_id, epoch, cost, detail
     ) -> None:
         with self.store.lock:
-            accepted = self.store.mark_failed(
-                task_id, step_id, FailureCode.NON_RECOVERABLE, detail, attempt
+            accepted, occupied = self.store.mark_failed(
+                task_id, step_id, FailureCode.NON_RECOVERABLE, detail, epoch
             )
             self.store.record_attempt(
                 task_id,
                 AttemptRecord(
-                    step_id=step_id, attempt=attempt, unit_id=unit_id,
+                    step_id=step_id, attempt=epoch - 1, unit_id=unit_id,
                     outcome=OUT_ERROR, detail=detail,
                 ),
             )
@@ -343,6 +443,19 @@ class OrchestrationEngine:
                     unit_id, cost,
                     f"non-recoverable task={task_id} step={step_id}",
                 )
+                # 任务进入 FAILED 终态：其余在飞步骤同步取消并释放占用，
+                # 它们的迟到结果之后按代次守卫丢弃，不会再改变对外视图。
+                for sid, ounit, ocost in occupied:
+                    self._release(
+                        ounit, ocost,
+                        f"task {task_id} terminated FAILED "
+                        f"({FailureCode.NON_RECOVERABLE.value}); step {sid} cancelled",
+                    )
+                    self._emit(
+                        "cancel_sibling", task_id, sid, ounit,
+                        reason="TASK_TERMINAL_FAILED",
+                        detail="in-flight sibling cancelled; late result will be discarded",
+                    )
                 self._emit(
                     "fail", task_id, step_id, unit_id,
                     reason=FailureCode.NON_RECOVERABLE.value, detail=detail,
@@ -356,30 +469,33 @@ class OrchestrationEngine:
         self.kick()
 
     def _finish_recoverable(
-        self, task_id, step_id, unit_id, attempt, cost,
+        self, task_id, step_id, unit_id, epoch, script_attempt, cost,
         max_retries, outcome, detail,
     ) -> None:
         with self.store.lock:
             self.store.record_attempt(
                 task_id,
                 AttemptRecord(
-                    step_id=step_id, attempt=attempt, unit_id=unit_id,
+                    step_id=step_id, attempt=script_attempt, unit_id=unit_id,
                     outcome=outcome, detail=detail,
                 ),
             )
-            will_retry = attempt < max_retries
+            # 还有重试额度当且仅当当前（即将计入的）可恢复失败序号 < max_retries。
+            # 让位抢占不是可恢复失败：script_attempt 不增长，因此不消耗额度。
+            will_retry = script_attempt < max_retries
             accepted = False
+            occupied: list = []
             if will_retry:
                 accepted = self.store.revert_to_pending(
                     task_id, step_id,
-                    f"{detail}; retry {attempt + 1}/{max_retries}",
-                    attempt,
+                    f"{detail}; retry {script_attempt + 1}/{max_retries}",
+                    epoch,
                 )
             else:
-                accepted = self.store.mark_failed(
+                accepted, occupied = self.store.mark_failed(
                     task_id, step_id, FailureCode.RETRIES_EXHAUSTED,
-                    f"{detail}; retries exhausted after {attempt + 1} attempt(s)",
-                    attempt,
+                    f"{detail}; retries exhausted after {script_attempt + 1} attempt(s)",
+                    epoch,
                 )
             if accepted:
                 self._release(
@@ -396,13 +512,24 @@ class OrchestrationEngine:
                 self._emit(
                     "retry", task_id, step_id, unit_id,
                     reason=outcome,
-                    detail=f"{detail}; scheduling retry {attempt + 1}/{max_retries}",
+                    detail=f"{detail}; scheduling retry {script_attempt + 1}/{max_retries}",
                 )
             elif accepted:
+                for sid, ounit, ocost in occupied:
+                    self._release(
+                        ounit, ocost,
+                        f"task {task_id} terminated FAILED "
+                        f"({FailureCode.RETRIES_EXHAUSTED.value}); step {sid} cancelled",
+                    )
+                    self._emit(
+                        "cancel_sibling", task_id, sid, ounit,
+                        reason="TASK_TERMINAL_FAILED",
+                        detail="in-flight sibling cancelled; late result will be discarded",
+                    )
                 self._emit(
                     "fail", task_id, step_id, unit_id,
                     reason=FailureCode.RETRIES_EXHAUSTED.value,
-                    detail=f"{detail}; exhausted after {attempt + 1} attempt(s)",
+                    detail=f"{detail}; exhausted after {script_attempt + 1} attempt(s)",
                 )
         self.kick()
 
@@ -410,8 +537,11 @@ class OrchestrationEngine:
     def cancel(self, task_id: str) -> bool:
         """取消任务并立即释放其全部占用。返回 False 表示任务已在终态。"""
         with self.store.lock:
+            # 先判定终态：只有 PREEMPTED/PENDING 步骤（无在飞占用）时
+            # occupied 也为空，但取消仍然生效，不能误判为 no-op。
+            already_terminal = self.store.is_terminal(task_id)
             occupied = self.store.cancel_task(task_id)
-            if not occupied:
+            if already_terminal:
                 view = self.store.snapshot_task(task_id)
                 self._emit(
                     "cancel", task_id,
@@ -424,7 +554,10 @@ class OrchestrationEngine:
             self._emit(
                 "cancel", task_id,
                 reason="CANCELLED",
-                detail=f"released {len(occupied)} in-flight step(s)",
+                detail=(
+                    f"cancelled; released {len(occupied)} in-flight step(s); "
+                    f"other unfinished steps marked CANCELLED"
+                ),
             )
         # 取消可能释放了容量，其它任务得以推进
         self.kick()

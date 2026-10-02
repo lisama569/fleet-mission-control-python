@@ -19,7 +19,8 @@ class StepState(str, Enum):
     PENDING -> DISPATCHED -> SUCCEEDED
                        \--> FAILED (不可恢复 / 重试耗尽)
     PENDING 在依赖未满足或派发被拒时保持 PENDING（带最近一次拒绝原因）。
-    PENDING/DISPATCHED --(任务取消或被抢占)--> CANCELLED（容量立即释放）。
+    DISPATCHED --(让位抢占)--> PREEMPTED -> DISPATCHED（容量腾出后自动重跑）
+    PENDING/PREEMPTED/DISPATCHED --(任务取消/失败终态连带收口)--> CANCELLED
     """
 
     PENDING = "PENDING"
@@ -27,6 +28,7 @@ class StepState(str, Enum):
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+    PREEMPTED = "PREEMPTED"
 
 
 class TaskState(str, Enum):
@@ -62,6 +64,39 @@ class FailureCode(str, Enum):
     NON_RECOVERABLE = "NON_RECOVERABLE"
 
 
+class Priority(str, Enum):
+    """任务提交优先级。
+
+    不携带 priority 的旧请求一律按 NORMAL 处理，默认行为与旧版本完全一致。
+    rank 仅用于内部排序：高优先级可抢占在飞的低优先级步骤；同级先来先服务。
+    """
+
+    HIGH = "HIGH"
+    NORMAL = "NORMAL"
+    LOW = "LOW"
+
+    @property
+    def rank(self) -> int:
+        return _PRIORITY_RANK[self]
+
+
+_PRIORITY_RANK: dict["Priority", int] = {
+    Priority.HIGH: 3,
+    Priority.NORMAL: 2,
+    Priority.LOW: 1,
+}
+
+
+class PreemptReason(str, Enum):
+    """步骤被让出（DISPATCHED -> PREEMPTED）的可区分原因。
+
+    让位不是执行失败：不进 FAILED、不消耗重试次数、副作用不受影响，
+    后续容量腾出时自动重新派发。
+    """
+
+    PREEMPT_FOR_HIGHER_PRIORITY = "PREEMPT_FOR_HIGHER_PRIORITY"
+
+
 @dataclass(frozen=True)
 class StepSpec:
     """单个步骤的声明。
@@ -82,10 +117,14 @@ class StepSpec:
 
 @dataclass(frozen=True)
 class TaskSpec:
-    """一次任务提交的声明。"""
+    """一次任务提交的声明。
+
+    priority 省略时取 NORMAL：旧的提交写法无需改动，行为与旧版本一致。
+    """
 
     task_id: str
     steps: tuple[StepSpec, ...]
+    priority: Priority = Priority.NORMAL
 
 
 @dataclass
@@ -116,6 +155,10 @@ class StepView:
     failure_detail: str = ""
     assigned_unit: str | None = None
     side_effects: int = 0
+    # 让位抢占：被让出次数 + 最近一次让位原因（None 表示从未被让出过）
+    preempt_count: int = 0
+    last_preempt_reason: PreemptReason | None = None
+    preempt_detail: str = ""
 
 
 @dataclass
@@ -126,6 +169,10 @@ class TaskView:
     state: TaskState
     steps: dict[str, StepView] = field(default_factory=dict)
     rejection: str = ""
+    priority: Priority = Priority.NORMAL
+    # 提交序号（全局限单调递增）：同优先级下据此先来先服务，
+    # 抢占重排不改变它，因此排队顺序始终稳定、可解释。
+    submit_seq: int = 0
 
 
 @dataclass
@@ -161,3 +208,5 @@ class EngineEvent:
     unit_id: str = ""
     reason: str = ""
     detail: str = ""
+    # 事件主体的优先级（preempt/preempted/dispatch 等），便于日志解释派发顺序
+    priority: str = ""

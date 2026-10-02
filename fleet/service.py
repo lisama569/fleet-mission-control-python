@@ -106,7 +106,9 @@ class FleetService:
                     detail="duplicate submit ignored; returning existing task",
                 )
                 return self.store.snapshot_task(spec.task_id), False
-            self.store.create_task(spec.task_id, list(spec.steps))
+            self.store.create_task(
+                spec.task_id, list(spec.steps), spec.priority
+            )
             for step in spec.steps:
                 if step.id in behaviors:
                     self.engine.register_behavior(
@@ -114,7 +116,11 @@ class FleetService:
                     )
             self.engine.emit(
                 "submit", spec.task_id,
-                detail=f"accepted {len(spec.steps)} step(s)",
+                detail=(
+                    f"accepted {len(spec.steps)} step(s) "
+                    f"priority={spec.priority.value}"
+                ),
+                priority=spec.priority.value,
             )
         self.engine.kick()
         return self.store.snapshot_task(spec.task_id), True

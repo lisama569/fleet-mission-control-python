@@ -60,14 +60,19 @@ def wait_terminal(service, task_id, timeout=3.0):
 
 def dump_task(title, view) -> None:
     """打印任务状态视图（测试日志的一部分）。"""
-    print(f"\n[{title}] task={view.task_id} state={view.state.value}")
+    print(
+        f"\n[{title}] task={view.task_id} state={view.state.value} "
+        f"priority={view.priority.value} submit_seq={view.submit_seq}"
+    )
     for sid, s in view.steps.items():
         print(
             f"  step={sid} state={s.state.value} attempt={s.attempts} "
             f"reject={s.last_reject.value if s.last_reject else '-'} "
             f"failure={s.failure_code.value if s.failure_code else '-'} "
             f"unit={s.assigned_unit} effects={s.side_effects} "
-            f"detail={s.failure_detail!r}"
+            f"preempt_count={s.preempt_count} "
+            f"preempt_reason={s.last_preempt_reason.value if s.last_preempt_reason else '-'} "
+            f"detail={s.failure_detail or s.preempt_detail!r}"
         )
 
 

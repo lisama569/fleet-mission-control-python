@@ -101,3 +101,76 @@ def test_units_endpoint_and_offline(client):
     u1 = next(u for u in c.get("/units").json()["units"] if u["unit_id"] == "u1")
     print("\nJUDGEMENT after offline:", u1)
     assert u1["online"] is False and u1["used"] == 0
+
+
+def test_legacy_submit_without_priority_defaults_normal(client):
+    """旧请求体（无 priority 字段）行为不变：默认 NORMAL，旧响应字段保留。"""
+    c, _ = client
+    c.post("/units", json={"unit_id": "u1", "capabilities": ["arm"], "capacity": 3})
+    # 完全旧式的请求体：没有 priority
+    body = {"task_id": "legacy", "steps": [
+        {"id": "a", "required_capability": "arm"},
+        {"id": "b", "required_capability": "arm", "depends_on": ["a"]},
+    ]}
+    r = c.post("/tasks", json=body)
+    assert r.status_code == 200
+    payload = r.json()
+    task = payload["task"]
+    # 新增字段
+    assert task["priority"] == "NORMAL"
+    assert task["submit_seq"] >= 1
+    # 旧字段原样保留
+    assert set(["task_id", "state", "rejection", "steps"]).issubset(task)
+    step = task["steps"][0]
+    for legacy_field in ("id", "state", "required_capability", "depends_on",
+                         "capacity_cost", "attempts", "max_retries",
+                         "last_reject", "failure_code", "failure_detail",
+                         "assigned_unit", "side_effects"):
+        assert legacy_field in step, legacy_field
+    # 新增抢占字段也在
+    assert step["preempt_count"] == 0 and step["last_preempt_reason"] is None
+
+
+def test_api_priority_preempts_lower(client):
+    """端到端：HIGH 通过 API 抢占 LOW，被让位步骤带可区分原因并最终成功一次。"""
+    c, _ = client
+    c.post("/units", json={"unit_id": "u1", "capabilities": ["arm"], "capacity": 1})
+    # LOW 占满
+    c.post("/tasks", json={
+        "task_id": "low-api", "priority": "LOW",
+        "steps": [{"id": "s", "required_capability": "arm", "timeout": 5.0,
+                   "delay": 0.4, "side_effects": 1}],
+    })
+    import time
+    time.sleep(0.05)
+    # HIGH 抢占（给一点执行时长，保证 PREEMPTED 让位窗口可被观测）
+    c.post("/tasks", json={
+        "task_id": "high-api", "priority": "HIGH",
+        "steps": [{"id": "s", "required_capability": "arm", "timeout": 5.0,
+                   "delay": 0.1}],
+    })
+
+    # LOW 应进入 PREEMPTED
+    seen_preempted = False
+    for _ in range(100):
+        v = c.get("/tasks/low-api").json()
+        st = v["steps"][0]
+        if st["state"] == "PREEMPTED":
+            seen_preempted = True
+            assert st["last_preempt_reason"] == "PREEMPT_FOR_HIGHER_PRIORITY"
+            assert st["preempt_count"] == 1
+            break
+        time.sleep(0.005)
+    assert seen_preempted
+
+    for _ in range(300):
+        v = c.get("/tasks/low-api").json()
+        if v["state"] == "SUCCEEDED":
+            break
+        time.sleep(0.02)
+    assert v["state"] == "SUCCEEDED"
+    assert v["priority"] == "LOW"
+    assert v["steps"][0]["side_effects"] == 1
+    assert c.get("/tasks/high-api").json()["state"] == "SUCCEEDED"
+    u1 = next(u for u in c.get("/units").json()["units"] if u["unit_id"] == "u1")
+    assert u1["used"] == 0
