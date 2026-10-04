@@ -93,7 +93,20 @@ PENDING ─有步骤被派发─> RUNNING ─全部步骤 SUCCEEDED─> SUCCEEDE
   返回首次提交的同一视图，响应中 `created=false` 区分幂等命中；
   不产生重复步骤、不重复注册行为、不重复执行。并发重复提交（多线程同时打）
   由提交临界区保证只创建一次。
-- **取消幂等**：已终态任务再次取消返回 `changed=false`，不报错。
+- **取消幂等**：取消接口返回 `changed` 标记，其语义严格按"本次是否真的发生了
+  状态变更"定义，与返回体里的任务状态、随后的 `GET /tasks/{id}` 三边一致：
+  - **有变更（`changed=true`）**：任务此前是非终态（`PENDING`/`RUNNING`），
+    本次把它及其全部非终态步骤改成了 `CANCELLED`。取消前**正在执行
+    （DISPATCHED）**的步骤，其容量在同一临界区内立即释放；**排队等容量、
+    依赖未满足、或被高优先级抢占后正等待重新派发（都是 PENDING，本就没占
+    容量）**的步骤同样被置 `CANCELLED`，只是不涉及容量释放。
+  - **无操作（`changed=false`）**：任务此前已经是终态（`SUCCEEDED`/
+    `FAILED`/`CANCELLED`）。再次取消不报错、不改任何状态、不触碰容量账本，
+    可安全重试。
+  - 因此"取消一个没占着容量的非终态任务"返回 `changed=true` 且任务状态为
+    `CANCELLED`（这是真实变更）；只有重复取消终态任务才是 `changed=false`。
+  - 取消后飞行中尝试的迟到结果一律按「状态 + 尝试代次」守卫丢弃：不会出现
+    "任务已取消、过一会儿步骤又变成成功或又冒出在飞步骤"。
 - **有界重试**：`timeout`（看门狗超时）与 `crashed`（异常退出）属可恢复
   错误，仅当已消耗的重试次数 `retries_used < max_retries` 时释放容量、
   步骤回到 `PENDING` 重新派发；否则进入 `FAILED/RETRIES_EXHAUSTED`。
@@ -174,6 +187,54 @@ watch -n0.2 'curl -s http://127.0.0.1:8000/tasks/low; curl -s http://127.0.0.1:8
 uv run pytest tests/test_preemption.py -s -o log_cli=true --log-cli-level=INFO
 ```
 
+### 5.4 取消语义与本地复现
+
+- **什么算"有变更"**：取消请求到达时任务仍是 `PENDING`/`RUNNING`，本次把它
+  改成 `CANCELLED`，即 `changed=true`——与它此刻有没有步骤在飞无关：
+  - 有步骤在飞：步骤置 `CANCELLED`，占用立即释放，排队任务马上能用容量；
+  - 只是排队等容量 / 依赖未满足 / 被抢占后等待重派：步骤同样置
+    `CANCELLED`（`changed=true`），但本来就没有占用，不产生释放账目。
+- **什么是"无操作"**：任务已是 `SUCCEEDED`/`FAILED`/`CANCELLED`，
+  `changed=false`，不报错、无任何额外变化。
+- **等待让位/排队中的任务取消后**：任务与其步骤都是 `CANCELLED` 终态；
+  即使旧的飞行尝试（让位前那次）之后才回报结果，也会被代次守卫丢弃，
+  任务不会复活、副作用不计数。
+- `cancel` 事件的 `reason` 明确交代本次取消的真实性质：
+  有效取消为 `CANCELLED`，detail 给出 `prior_state`（取消前任务状态）、
+  多少步骤在飞（容量立即释放）、多少步骤在等待（本不占容量）；
+  对已终态任务的幂等无操作原因为 `ALREADY_TERMINAL`（并带取消前状态），
+  不会把有效取消误报成 no-op。
+
+```bash
+# 终端 1：启动服务
+uv run fastapi dev main.py
+
+# 终端 2：低优先级长任务占满 unit-arm-1（容量 2）
+curl -s -X POST http://127.0.0.1:8000/tasks -H 'content-type: application/json' -d '{
+  "task_id": "low", "priority": "low",
+  "steps": [{"id": "a", "required_capability": "arm", "capacity_cost": 2,
+             "timeout": 30, "delay": 20}]}'
+
+# 高优先级任务把 low 挤下去（low 回到 PENDING 等待重派，不占容量）
+curl -s -X POST http://127.0.0.1:8000/tasks -H 'content-type: application/json' -d '{
+  "task_id": "high", "priority": "high",
+  "steps": [{"id": "a", "required_capability": "arm", "capacity_cost": 2,
+             "timeout": 30, "delay": 5}]}'
+
+# 此时取消 low：changed=true、state=CANCELLED（旧实现会误报 changed=false）
+curl -s -X POST http://127.0.0.1:8000/tasks/low/cancel
+# 再取消一次：changed=false、state 仍 CANCELLED（幂等无操作）
+curl -s -X POST http://127.0.0.1:8000/tasks/low/cancel
+# 排队等容量的任务同理：先占满容量再提交一个任务，然后立刻取消，
+# 首次取消 changed=true、state=CANCELLED，且 GET 复查一致
+```
+
+自动化复现（覆盖让位等待取消、排队取消、终态幂等、在飞释放、并发取消配平）：
+
+```bash
+uv run pytest tests/test_cancel.py -s -o log_cli=true --log-cli-level=INFO
+```
+
 ## 6. 能力与容量约束的配置方式
 
 ### API
@@ -246,7 +307,7 @@ print(svc.get_task("t").state)   # TaskState.SUCCEEDED
 ## 7. 本地验证
 
 ```bash
-# 全部单测（33 个）：并发提交、重复提交、超时、取消、离线、优先级抢占等
+# 全部单测（42 个）：并发提交、重复提交、超时、取消、离线、优先级抢占等
 uv run pytest -q
 
 # 查看带"输入事件 + 判定依据"的详细日志
@@ -256,6 +317,7 @@ uv run pytest -s -o log_cli=true --log-cli-level=INFO
 uv run pytest tests/test_retry.py -q
 uv run pytest tests/test_concurrency_lifecycle.py -q
 uv run pytest tests/test_preemption.py -q
+uv run pytest tests/test_cancel.py -q
 ```
 
 每个用例都会：

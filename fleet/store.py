@@ -44,6 +44,36 @@ class StepRecord:
     attempt_log: list[AttemptRecord] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class CancelOutcome:
+    """取消操作的原子结果（store 临界区内得出，事实即最终视图）。
+
+    changed: 本次是否真的把一个非终态任务改成了 CANCELLED。
+             False 仅发生在任务此前已处于终态（成功/失败/已取消），
+             即幂等无操作；此时 cancelled_steps/released 必为空。
+    cancelled_steps: 本次被置为 CANCELLED 的非终态步骤 id
+                     （排队中 PENDING、被抢占等待重派 PENDING、在飞 DISPATCHED）。
+    released: 本次需要释放容量的 (step_id, unit_id, cost)——
+              仅包含取消前确实占着执行容量的 DISPATCHED 步骤。
+    prior_state: 取消前的任务状态（事件日志交代真实原因用）。
+    """
+
+    changed: bool
+    cancelled_steps: tuple[str, ...]
+    released: tuple[tuple[str, str, int], ...]
+    prior_state: TaskState | None = None
+
+    @property
+    def inflight_released(self) -> int:
+        """取消前在飞、容量被立即释放的步骤数。"""
+        return len(self.released)
+
+    @property
+    def waiting_cancelled(self) -> int:
+        """取消前并未占容量（排队/让位等待）的被取消步骤数。"""
+        return len(self.cancelled_steps) - len(self.released)
+
+
 @dataclass
 class TaskRecord:
     """任务的内部可变记录。"""
@@ -271,34 +301,53 @@ class InMemoryStore:
             return True
 
     # ---------- 取消 / 离线 ----------
-    def cancel_task(self, task_id: str) -> list[tuple[str, str, int]]:
-        """取消任务。返回需要释放容量的 (step_id, unit_id, cost) 列表。
+    def cancel_task(self, task_id: str) -> CancelOutcome:
+        """取消任务，返回原子的取消结果。
 
-        - 任务已终态：返回空列表（调用方据此把取消当幂等操作处理）。
-        - 否则所有未成功/未失败的步骤置 CANCELLED；处于 DISPATCHED 的步骤
-          其容量占用由引擎按返回列表逐项释放，飞行结果稍后到达时会被丢弃。
+        - 任务此前已终态（CANCELLED/SUCCEEDED/FAILED）：changed=False、
+          清单为空——幂等无操作，不报错、不产生任何额外变化。
+        - 否则 changed=True：所有未成功/未失败的步骤（含排队中 PENDING、
+          被抢占等待重派 PENDING、在飞 DISPATCHED）一律置 CANCELLED，
+          任务置 CANCELLED。其中取消前处于 DISPATCHED 的步骤才实际占着
+          执行容量，计入 released，由引擎逐项且仅释放一次；PENDING 步骤
+          本就不占容量，不出现在 released 中（绝不虚释放）。
+        飞行尝试稍后到达时会被状态/代次守卫丢弃，不会复活步骤。
         """
         with self.lock:
             rec = self._record(task_id)
-            if rec.state in (
+            prior_state = rec.state
+            if prior_state in (
                 TaskState.CANCELLED,
                 TaskState.SUCCEEDED,
                 TaskState.FAILED,
             ):
-                return []
+                return CancelOutcome(
+                    changed=False,
+                    cancelled_steps=(),
+                    released=(),
+                    prior_state=prior_state,
+                )
+            cancelled: list[str] = []
             occupied: list[tuple[str, str, int]] = []
             for sid in rec.order:
                 step = rec.steps[sid]
                 if step.state in (StepState.SUCCEEDED, StepState.FAILED):
                     continue
                 if step.state == StepState.DISPATCHED and step.assigned_unit:
+                    # 取消前确实占着执行容量：立即回收，且只回收这一次。
                     occupied.append(
                         (sid, step.assigned_unit, step.spec.capacity_cost)
                     )
                 step.state = StepState.CANCELLED
                 step.assigned_unit = None
+                cancelled.append(sid)
             rec.state = TaskState.CANCELLED
-            return occupied
+            return CancelOutcome(
+                changed=True,
+                cancelled_steps=tuple(cancelled),
+                released=tuple(occupied),
+                prior_state=prior_state,
+            )
 
     def is_cancelled(self, task_id: str) -> bool:
         with self.lock:

@@ -94,7 +94,7 @@ HTTP 层     │ fleet/api.py (FastAPI 路由)   │  GET / 保持原样
 | 重试耗尽     | `FAILED/RETRIES_EXHAUSTED` + `release`                               |
 | 不可恢复     | `FAILED/NON_RECOVERABLE` + `release`（不重试）                        |
 | 高优先级抢占 | 在飞步骤回 `PENDING`（`PREEMPTED`）+ 立即 `release`；迟到结果丢弃     |
-| 任务取消     | 所有未终态步骤置 `CANCELLED`，在飞占用立即 `release`；迟到结果丢弃     |
+| 任务取消     | 非终态任务的所有非终态步骤置 `CANCELLED`；仅在飞步骤产生 `release`；迟到结果丢弃 |
 | 任务进入终态 | 级联取消同任务仍在飞步骤并 `release`（见 §4.1）                       |
 | 单元离线     | `mark_offline` + 在飞步骤回 `PENDING` + 释放其占用，重派到其它单元     |
 
@@ -116,11 +116,39 @@ HTTP 层     │ fleet/api.py (FastAPI 路由)   │  GET / 保持原样
 - `retries_used`：只在可恢复失败（超时/异常退出）时 +1，是
   `max_retries` 的唯一计量。抢占让位、离线重排队都不消耗重试额度。
 
+### 4.3 取消：changed 语义、三边一致与账目配对
+
+`store.cancel_task` 在同一临界区内得出不可分割的 `CancelOutcome`，
+返回后状态即最终视图，避免"标记与状态各算各的"：
+
+- 任务此前已终态（`SUCCEEDED`/`FAILED`/`CANCELLED`）：
+  `changed=false`、步骤清单与释放清单均空——**幂等无操作**，不改状态、
+  不触碰容量账本。
+- 否则 `changed=true`：所有非终态步骤（无论 `PENDING` 还是 `DISPATCHED`）
+  一律置 `CANCELLED`，任务置 `CANCELLED`。
+  - `released` **只包含取消前确实处于 `DISPATCHED` 的步骤**：它们占着
+    单元容量，由引擎逐项且仅释放一次；排队等容量、依赖未满足、被抢占后
+    等待重派的 `PENDING` 步骤本不占容量，不会出现在释放清单中，因此
+    既不会取消了还占容量，也不会把别人的占用"虚释放/重复释放"。
+  - `prior_state` 与两类计数（在飞释放数、等待取消数）写入 `cancel`
+    事件，日志如实交代真实原因与实际影响：有效取消 reason=`CANCELLED`
+    并附这些计数；幂等无操作 reason=`ALREADY_TERMINAL` 并带取消前状态，
+    而不是笼统的 "already terminal" 误报。
+
+因此服务层返回的 `changed`、返回体里的任务/步骤状态、随后的查询三边
+必然一致：`changed=true` 当且仅当本次把一个非终态任务改成了
+`CANCELLED`。取消与抢占、离线、迟到结果在同把 store 锁上竞争，状态
+收口与容量释放原子配对，迟到结果被代次守卫丢弃，取消后不会再出现
+在飞步骤或成功收口。
+
 ## 5. 幂等
 
 - 提交在 store 锁内完成「检查 `task_id` 是否已存在 → 创建任务/注册行为」，
   并发重复提交只有一个线程走创建分支；其余返回同一快照、`created=false`。
 - 重复提交携带的新声明/新行为被忽略，因此不会产生重复步骤或重复执行。
+- 取消按 §4.3 的 `CancelOutcome` 定义幂等：仅首次把非终态任务改终态时
+  `changed=true`；对已终态任务重复取消是无操作（`changed=false`，
+  无状态变化、无容量动作、无错误）。
 - 成功副作用仅在成功收口累加一次；重试链路上的失败尝试 `side_effect_count=0`。
 
 ## 6. 可观测性与可复现

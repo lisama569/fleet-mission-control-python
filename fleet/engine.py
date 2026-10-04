@@ -476,9 +476,12 @@ class OrchestrationEngine:
                 )
             else:
                 self._emit(
-                    "stale crashed/timeout", task_id, step_id, unit_id,
+                    "stale", task_id, step_id, unit_id,
                     reason="STALE_RESULT",
-                    detail="late recoverable result discarded; capacity already released",
+                    detail=(
+                        f"late {outcome} result discarded; "
+                        f"capacity already released"
+                    ),
                 )
             if accepted and will_retry:
                 self._emit(
@@ -498,23 +501,39 @@ class OrchestrationEngine:
 
     # ---------------- 取消 / 离线 ----------------
     def cancel(self, task_id: str) -> bool:
-        """取消任务并立即释放其全部占用。返回 False 表示任务已在终态。"""
+        """取消任务。返回本次是否真的发生了状态变更。
+
+        - 任务此前已终态（成功/失败/已取消）：幂等无操作，返回 False，
+          不改任何状态、不触碰容量账本。
+        - 否则把全部非终态步骤置 CANCELLED 并返回 True；取消前在飞的步骤
+          其占用在同一临界区内逐项释放（仅这些步骤占着容量，只释放一次），
+          排队中/被抢占等待重派的 PENDING 步骤本不占容量，无需释放。
+        """
         with self.store.lock:
-            occupied = self.store.cancel_task(task_id)
-            if not occupied:
-                view = self.store.snapshot_task(task_id)
+            outcome = self.store.cancel_task(task_id)
+            if not outcome.changed:
+                # 真实原因就是"此前已终态"：日志必须与实际一致，不能把
+                # "非终态但无在飞步骤"的有效取消误报成 no-op。
                 self._emit(
                     "cancel", task_id,
-                    reason=view.state.value,
-                    detail="cancel no-op: task already in terminal state",
+                    reason="ALREADY_TERMINAL",
+                    detail=(
+                        "cancel no-op: task already terminal "
+                        f"prior_state={outcome.prior_state.value if outcome.prior_state else '-'}"
+                    ),
                 )
                 return False
-            for step_id, unit_id, cost in occupied:
+            for step_id, unit_id, cost in outcome.released:
                 self._release(unit_id, cost, f"cancelled task={task_id} step={step_id}")
             self._emit(
                 "cancel", task_id,
                 reason="CANCELLED",
-                detail=f"released {len(occupied)} in-flight step(s)",
+                detail=(
+                    f"cancelled {len(outcome.cancelled_steps)} non-terminal step(s): "
+                    f"{outcome.inflight_released} in-flight (capacity released now), "
+                    f"{outcome.waiting_cancelled} waiting (held no capacity); "
+                    f"prior_state={outcome.prior_state.value if outcome.prior_state else '-'}"
+                ),
             )
         # 取消可能释放了容量，其它任务得以推进
         self.kick()
