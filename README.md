@@ -93,7 +93,19 @@ PENDING ─有步骤被派发─> RUNNING ─全部步骤 SUCCEEDED─> SUCCEEDE
   返回首次提交的同一视图，响应中 `created=false` 区分幂等命中；
   不产生重复步骤、不重复注册行为、不重复执行。并发重复提交（多线程同时打）
   由提交临界区保证只创建一次。
-- **取消幂等**：已终态任务再次取消返回 `changed=false`，不报错。
+- **取消幂等**：取消返回的 `changed` 标记、返回体里的任务状态、随后
+  `GET` 查询三边始终一致：
+  - **有变更（`changed=true`）**：当且仅当本次真的把一个**非终态**任务
+    改成了 `CANCELLED`，与它当时有没有占着执行容量**无关**——有步骤在飞
+    （立刻释放占用）、一直排队等容量还没轮到、被高优先级抢占后正等待
+    重新派发、执行单元离线后已重排队，这几种非终态情形取消都算变更；
+  - **无操作（`changed=false`）**：任务此前已在终态（`SUCCEEDED`/
+    `FAILED`/`CANCELLED`），再次取消不报错、不改状态、不碰容量；
+  - 等待让位 / 排队中的任务被取消后：任务与其非终态步骤一律转为
+    `CANCELLED`（不会继续排队或被重新派发），它们本就没占容量，因此
+    没有容量需要释放；在飞步骤被取消时占用立即全部释放，排队任务马上
+    能用；所有被取消步骤飞行尝试的迟到结果一律丢弃，不会出现"任务已
+    取消、过一会儿又有步骤变成成功或又冒出在飞步骤"。
 - **有界重试**：`timeout`（看门狗超时）与 `crashed`（异常退出）属可恢复
   错误，仅当已消耗的重试次数 `retries_used < max_retries` 时释放容量、
   步骤回到 `PENDING` 重新派发；否则进入 `FAILED/RETRIES_EXHAUSTED`。
@@ -174,6 +186,56 @@ watch -n0.2 'curl -s http://127.0.0.1:8000/tasks/low; curl -s http://127.0.0.1:8
 uv run pytest tests/test_preemption.py -s -o log_cli=true --log-cli-level=INFO
 ```
 
+### 5.4 取消语义与本地复现
+
+判定一张表（`POST /tasks/{id}/cancel` 的 `changed` 字段）：
+
+| 取消时任务处境                              | 是否占容量 | changed   | 取消后状态           |
+|---------------------------------------------|------------|-----------|----------------------|
+| 有步骤 `DISPATCHED` 在飞                    | 是         | `true`    | 任务/在飞步骤 CANCELLED，占用立即全部释放 |
+| 一直排队等容量，从未派发                    | 否         | `true`    | 任务/排队步骤 CANCELLED，无容量可释放 |
+| 被高优先级抢占后等待重新派发（PREEMPTED）   | 否         | `true`    | 任务/让位步骤 CANCELLED，无容量可释放 |
+| 在飞单元离线后已重排队                      | 否         | `true`    | 任务/重排队步骤 CANCELLED，无容量可释放 |
+| 任务已 SUCCEEDED / FAILED / CANCELLED       | —          | `false`   | 原终态不变（幂等无操作） |
+
+引擎事件如实交代本次取消的原因与影响：
+
+- 真变更：`event cancel ... reason=CANCELLED detail=... released N in-flight
+  step(s)`；不占容量的等待任务则为 `detail=... no in-flight capacity;
+  waiting step(s) ['s(PREEMPTED)'] ... no capacity to release`，等待原因
+  取 `PREEMPTED` / `INSUFFICIENT_CAPACITY` / `UNIT_OFFLINE_REQUEUED` /
+  `PURE_QUEUE`；
+- 幂等无操作：`event cancel ... reason=ALREADY_CANCELLED（或
+  ALREADY_SUCCEEDED/ALREADY_FAILED）detail=... state and capacity untouched`。
+
+#### HTTP 手工复现
+
+```bash
+uv run fastapi dev main.py
+
+# 占满 u1 容量的长任务 + 一个永远排不上队的任务
+curl -s -X POST localhost:8000/tasks -H 'content-type: application/json' -d '{
+  "task_id":"blocker","steps":[{"id":"s","required_capability":"arm",
+  "timeout":30,"delay":10}]}'
+sleep 0.2
+curl -s -X POST localhost:8000/tasks -H 'content-type: application/json' -d '{
+  "task_id":"queued","steps":[{"id":"s","required_capability":"arm","timeout":5}]}'
+
+# 排队任务取消：changed=true（虽然它一分容量都没占），状态 CANCELLED
+curl -s -X POST localhost:8000/tasks/queued/cancel
+# 再次取消：changed=false，状态仍是 CANCELLED（幂等无操作）
+curl -s -X POST localhost:8000/tasks/queued/cancel
+curl -s localhost:8000/tasks/queued
+```
+
+#### 自动化复现（每个用例打印 INPUT 事件与 JUDGEMENT 判定依据）
+
+```bash
+# 取消语义全套 7 个用例（让位等待 / 排队 / 离线重排队 / 终态幂等 /
+# 在飞释放 / 并发提交+取消 / HTTP 端到端）
+uv run pytest tests/test_cancel.py -s -o log_cli=true --log-cli-level=INFO
+```
+
 ## 6. 能力与容量约束的配置方式
 
 ### API
@@ -246,7 +308,7 @@ print(svc.get_task("t").state)   # TaskState.SUCCEEDED
 ## 7. 本地验证
 
 ```bash
-# 全部单测（33 个）：并发提交、重复提交、超时、取消、离线、优先级抢占等
+# 全部单测（40 个）：并发提交、重复提交、超时、取消、离线、优先级抢占等
 uv run pytest -q
 
 # 查看带"输入事件 + 判定依据"的详细日志
@@ -256,14 +318,17 @@ uv run pytest -s -o log_cli=true --log-cli-level=INFO
 uv run pytest tests/test_retry.py -q
 uv run pytest tests/test_concurrency_lifecycle.py -q
 uv run pytest tests/test_preemption.py -q
+uv run pytest tests/test_cancel.py -q
 ```
 
 每个用例都会：
 1. 用 `print` 显式输出 **INPUT**（提交声明、行为脚本、取消/离线动作）与
-   **JUDGEMENT**（观察到的状态、拒绝原因、失败码、容量账本）；
+   **JUDGEMENT**（观察到的状态、拒绝原因、失败码、`changed` 标记与三边
+   一致性、容量账本）；
 2. 引擎通过 logger 输出有序事件（`submit/dispatch/reject/success/retry/
    fail/timeout/cancel/offline/preempt/release`），含任务优先级、派发尝试
-   序号、容量占用与释放，便于复现判定路径。
+   序号、容量占用与释放、以及取消的真实原因（`CANCELLED` / `ALREADY_*`
+   与等待原因 `PREEMPTED` 等），便于复现判定路径。
 
 ## 8. 目录结构
 

@@ -5,7 +5,12 @@
 - 以 task_id 作为提交标识；首次提交登记任务、注册行为脚本并触发调度。
 - 相同 task_id 的重复提交：不产生重复步骤、不重复注册行为、不重复执行，
   直接返回首次提交的同一状态视图（created=False 供调用方/测试区分）。
-- 取消也幂等：已处于终态的任务再次取消返回 changed=False，不报错。
+- 取消也幂等，且"是否变更"标记与状态严格一致：
+  取消一个**非终态**任务（无论它当时有没有占着执行容量——在飞、
+  排队等容量、被抢占让位后等待重派、单元离线重排队）一律返回
+  changed=True 且任务转为 CANCELLED；取消此前**已在终态**
+  （SUCCEEDED/FAILED/CANCELLED）的任务返回 changed=False，
+  状态机与容量账本一律不动，不报错。
 """
 
 from __future__ import annotations
@@ -136,6 +141,12 @@ class FleetService:
         return self.store.list_tasks()
 
     def cancel(self, task_id: str) -> tuple[TaskView, bool]:
+        """取消任务，返回 (取消后的状态视图, 本次是否真的发生了变更)。
+
+        changed=True  当且仅当本次把一个非终态任务改成了 CANCELLED——
+        与它是否占着容量无关；changed=False 仅当任务此前已终态（幂等无操作）。
+        changed、返回视图的任务状态与随后的 get_task 三边始终一致。
+        """
         if not self.store.has_task(task_id):
             raise UnknownTaskError(task_id)
         changed = self.engine.cancel(task_id)

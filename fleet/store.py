@@ -27,6 +27,31 @@ from .models import (
 
 
 @dataclass
+class CancelOutcome:
+    """取消操作的原子判定结果（在 store 锁临界区内得出）。
+
+    changed: 本次是否真的把一个非终态任务改成了 CANCELLED。
+             - False：任务此前已是终态（SUCCEEDED/FAILED/CANCELLED），
+               本次为幂等无操作，状态机一步未动；
+             - True：任务此前非终态，本次真的发生了状态变更。
+    occupied: 被取消时仍处于 DISPATCHED 的步骤占用清单
+              (step_id, unit_id, cost)，引擎据此逐项释放容量；
+              changed=True 时也可能为空——任务正排队等容量、或在飞步骤
+              刚被抢占让位/单元离线重排队，都没占着容量，但取消依然算变更。
+    waiting_steps: 被取消时处于 PENDING（排队/让位等待/离线重排队）的
+                   (步骤 id, 等待原因)。等待原因取步骤粘滞的 last_reject
+                   （PREEMPTED / UNIT_OFFLINE_REQUEUED / INSUFFICIENT_CAPACITY
+                   等）；尚未轮询到、未记录拒绝原因的纯排队记 None。
+    terminal_state: changed=False 时任务此前所处的终态（供事件日志如实记录）。
+    """
+
+    changed: bool
+    occupied: list[tuple[str, str, int]] = field(default_factory=list)
+    waiting_steps: list[tuple[str, str | None]] = field(default_factory=list)
+    terminal_state: TaskState | None = None
+
+
+@dataclass
 class StepRecord:
     """步骤的内部可变记录。"""
 
@@ -59,6 +84,13 @@ class TaskRecord:
 
 class InMemoryStore:
     """并发安全的内存存储。"""
+
+    # 非失败性让位原因（在飞步骤被迫回到 PENDING 等待重新派发）：
+    # 在重新真正派发成功之前"粘滞"保留，不被例行的容量/候选不足拒绝覆盖，
+    # 保证"它为什么在排队"始终可查询、可区分、可用于取消日志。
+    STICKY_WAIT_REASONS = frozenset(
+        {RejectReason.PREEMPTED, RejectReason.UNIT_OFFLINE_REQUEUED}
+    )
 
     def __init__(self) -> None:
         self.lock = threading.RLock()
@@ -194,19 +226,27 @@ class InMemoryStore:
             if not self._deps_met(rec, target):
                 target.last_reject = RejectReason.DEPENDENCY_NOT_MET
                 return None, RejectReason.DEPENDENCY_NOT_MET
-            # PREEMPTED 保持"粘滞"：被让位的步骤在重新派发前一直展示该原因，
-            # 不会被随后例行的容量不足拒绝覆盖，保证让位原因可查询、可区分。
-            if target.last_reject != RejectReason.PREEMPTED:
+            # PREEMPTED / UNIT_OFFLINE_REQUEUED 保持"粘滞"：非失败性让位的
+            # 步骤在重新派发前一直展示其让位原因，不会被随后例行的容量不足
+            # /无在线单元拒绝覆盖，保证等待原因可查询、可区分。
+            if target.last_reject not in self.STICKY_WAIT_REASONS:
                 target.last_reject = None
             return target, None
 
     def record_rejection(self, task_id: str, step_id: str, reason: RejectReason) -> None:
         with self.lock:
             step = self._record(task_id).steps[step_id]
-            # 被抢占让位的步骤等待容量重派是预期行为：保留 PREEMPTED 作为
-            # 可区分的等待原因，不被 INSUFFICIENT_CAPACITY 覆盖。
-            if step.last_reject == RejectReason.PREEMPTED and (
-                reason == RejectReason.INSUFFICIENT_CAPACITY
+            # 非失败性让位（抢占 / 单元离线）后等待容量重派是预期行为：
+            # 保留粘滞原因，不被 INSUFFICIENT_CAPACITY / NO_CANDIDATE_UNIT
+            # 之类的例行拒绝覆盖。
+            if (
+                step.last_reject in self.STICKY_WAIT_REASONS
+                and reason
+                in (
+                    RejectReason.INSUFFICIENT_CAPACITY,
+                    RejectReason.NO_CANDIDATE_UNIT,
+                    RejectReason.CAPABILITY_MISMATCH,
+                )
             ):
                 return
             step.last_reject = reason
@@ -271,12 +311,24 @@ class InMemoryStore:
             return True
 
     # ---------- 取消 / 离线 ----------
-    def cancel_task(self, task_id: str) -> list[tuple[str, str, int]]:
-        """取消任务。返回需要释放容量的 (step_id, unit_id, cost) 列表。
+    def cancel_task(self, task_id: str) -> CancelOutcome:
+        """取消任务并返回原子判定结果 CancelOutcome。
 
-        - 任务已终态：返回空列表（调用方据此把取消当幂等操作处理）。
-        - 否则所有未成功/未失败的步骤置 CANCELLED；处于 DISPATCHED 的步骤
-          其容量占用由引擎按返回列表逐项释放，飞行结果稍后到达时会被丢弃。
+        三种情形严格区分（"是否变更"与"是否释放容量"是两件事）：
+
+        1. 任务此前已终态（SUCCEEDED/FAILED/CANCELLED）：
+           ``changed=False``，状态机一步未动——幂等无操作；
+        2. 任务非终态、且有步骤正处于 DISPATCHED：
+           ``changed=True``，``occupied`` 非空，引擎按清单逐项释放容量；
+        3. 任务非终态、但没有步骤在飞（一直排队等容量 / 被高优先级抢占后
+           等待重派 / 在飞单元离线后已重排队）：
+           ``changed=True``，``occupied`` 为空、``waiting_steps`` 非空。
+           这类任务没占着容量，但本次确实把非终态任务改成了 CANCELLED，
+           绝不能因为"没有容量可释放"就误报成无变化。
+
+        所有未 SUCCEEDED/FAILED 的步骤置 CANCELLED；处于 DISPATCHED 的步骤
+        其容量占用由引擎按 occupied 清单恰好释放一次，飞行结果稍后到达时
+        会被「状态 + 尝试代次」守卫丢弃。
         """
         with self.lock:
             rec = self._record(task_id)
@@ -285,8 +337,9 @@ class InMemoryStore:
                 TaskState.SUCCEEDED,
                 TaskState.FAILED,
             ):
-                return []
+                return CancelOutcome(changed=False, terminal_state=rec.state)
             occupied: list[tuple[str, str, int]] = []
+            waiting_steps: list[tuple[str, str | None]] = []
             for sid in rec.order:
                 step = rec.steps[sid]
                 if step.state in (StepState.SUCCEEDED, StepState.FAILED):
@@ -295,10 +348,20 @@ class InMemoryStore:
                     occupied.append(
                         (sid, step.assigned_unit, step.spec.capacity_cost)
                     )
+                elif step.state == StepState.PENDING:
+                    why = (
+                        step.last_reject.value
+                        if step.last_reject is not None else None
+                    )
+                    waiting_steps.append((sid, why))
                 step.state = StepState.CANCELLED
                 step.assigned_unit = None
             rec.state = TaskState.CANCELLED
-            return occupied
+            return CancelOutcome(
+                changed=True,
+                occupied=occupied,
+                waiting_steps=waiting_steps,
+            )
 
     def is_cancelled(self, task_id: str) -> bool:
         with self.lock:
@@ -340,6 +403,8 @@ class InMemoryStore:
                     ):
                         step.state = StepState.PENDING
                         step.assigned_unit = None
+                        # 非失败性让位：可区分、粘滞，不消耗重试额度。
+                        step.last_reject = RejectReason.UNIT_OFFLINE_REQUEUED
                         step.failure_detail = (
                             f"unit {unit_id} went offline; requeued for redispatch"
                         )

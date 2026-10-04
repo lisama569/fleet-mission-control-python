@@ -94,7 +94,7 @@ HTTP 层     │ fleet/api.py (FastAPI 路由)   │  GET / 保持原样
 | 重试耗尽     | `FAILED/RETRIES_EXHAUSTED` + `release`                               |
 | 不可恢复     | `FAILED/NON_RECOVERABLE` + `release`（不重试）                        |
 | 高优先级抢占 | 在飞步骤回 `PENDING`（`PREEMPTED`）+ 立即 `release`；迟到结果丢弃     |
-| 任务取消     | 所有未终态步骤置 `CANCELLED`，在飞占用立即 `release`；迟到结果丢弃     |
+| 任务取消     | 所有非终态步骤置 `CANCELLED`；仅在飞步骤有占用并立即 `release`；迟到结果丢弃。排队/让位/离线重排队的步骤本就无占用，取消仍算"有变更" |
 | 任务进入终态 | 级联取消同任务仍在飞步骤并 `release`（见 §4.1）                       |
 | 单元离线     | `mark_offline` + 在飞步骤回 `PENDING` + 释放其占用，重派到其它单元     |
 
@@ -122,6 +122,33 @@ HTTP 层     │ fleet/api.py (FastAPI 路由)   │  GET / 保持原样
   并发重复提交只有一个线程走创建分支；其余返回同一快照、`created=false`。
 - 重复提交携带的新声明/新行为被忽略，因此不会产生重复步骤或重复执行。
 - 成功副作用仅在成功收口累加一次；重试链路上的失败尝试 `side_effect_count=0`。
+
+### 5.1 取消的「有变更 / 无操作」边界
+
+取消在同一个 store 锁临界区内判定并流转，返回结构化的 `CancelOutcome`
+（`changed` / `occupied` / `waiting_steps` / `terminal_state`），把
+**"状态是否变更"与"是否释放容量"两件事解耦**：
+
+| 取消时处境 | 判定 | 容量动作 |
+|------------|------|----------|
+| 任务已终态 SUCCEEDED/FAILED/CANCELLED | `changed=false`（幂等无操作） | 不碰 |
+| 非终态 + 有步骤 DISPATCHED | `changed=true`，`occupied` 非空 | 按清单恰好释放一次 |
+| 非终态 + 仅 PENDING（排队等容量 / PREEMPTED 让位等待 / 离线重排队） | `changed=true`，`occupied` 为空、`waiting_steps` 非空 | 本就无占用，无需释放 |
+
+因此"没占容量"绝不等于"没有变更"：服务层/API 的 `changed` 标记、返回体
+任务状态与随后查询三边始终一致。并发取消与抢占/离线/迟到结果竞争时：
+
+- 取消与派发/抢占/离线都在同一把锁上串行化，且取消临界区末尾才 `kick`，
+  被取消任务不会在释放后又被本线程重新派发；
+- 被取消步骤的飞行结果由「状态 + 尝试代次」守卫判定为 stale 直接丢弃，
+  不重复释放容量、不计副作用、不复活步骤（容量释放的唯一出口 `_release`
+  另有 `ExecutionUnit.release` 的超额释放断言兜底）。
+
+无操作与真变更的事件也严格区分：真变更为
+`reason=CANCELLED`（detail 含在飞释放数与等待步骤及其等待原因
+PREEMPTED/INSUFFICIENT_CAPACITY/UNIT_OFFLINE_REQUEUED/PURE_QUEUE），
+无操作为 `reason=ALREADY_<此前终态>`，detail 明确"state and capacity
+untouched"，不会给出与实际不符的取消原因。
 
 ## 6. 可观测性与可复现
 

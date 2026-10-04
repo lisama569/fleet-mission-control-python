@@ -8,6 +8,9 @@
 - GET  /tasks                列出任务 id
 - GET  /tasks/{task_id}      查询任务与步骤状态视图
 - POST /tasks/{task_id}/cancel  取消任务（幂等）
+  响应 {"changed": <bool>, "task": <task>}：changed=true 当且仅当本次真的
+  把一个非终态任务改成了 CANCELLED（在飞 / 排队等容量 / 被抢占让位等待
+  重派 / 离线重排队都算）；任务此前已终态时 changed=false，状态与容量不变。
 - POST /units                登记执行单元
 - GET  /units                查询单元能力/容量与占用
 - POST /units/{unit_id}/offline | /online  模拟单元掉线/恢复

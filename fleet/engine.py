@@ -498,23 +498,69 @@ class OrchestrationEngine:
 
     # ---------------- 取消 / 离线 ----------------
     def cancel(self, task_id: str) -> bool:
-        """取消任务并立即释放其全部占用。返回 False 表示任务已在终态。"""
+        """取消任务并立即释放其全部占用。
+
+        返回语义（与返回体任务状态、后续查询三边始终一致）：
+        - True：本次真的把一个非终态任务改成了 CANCELLED。无论它当时是否
+          占着执行容量（在飞 / 排队等容量 / 被抢占后等待重派 / 离线重排队），
+          只要此前非终态，就算发生了变更；
+        - False：任务此前已在终态（SUCCEEDED/FAILED/CANCELLED），幂等无操作，
+          状态机一步未动、容量一分不碰。
+
+        在飞步骤的容量在同一临界区内按占用清单恰好释放一次；排队/让位中的
+        步骤本就无容量可释放，只做状态流转。所有被取消步骤的飞行尝试其迟到
+        结果会被「状态 + 尝试代次」守卫丢弃，不会复活步骤或重复释放容量。
+        """
         with self.store.lock:
-            occupied = self.store.cancel_task(task_id)
-            if not occupied:
-                view = self.store.snapshot_task(task_id)
+            outcome = self.store.cancel_task(task_id)
+            if not outcome.changed:
+                # 幂等无操作：如实记录任务"此前"的终态，而不是笼统地宣称
+                # 本次取消了什么（本次什么都没改）。
+                prior = (
+                    outcome.terminal_state.value
+                    if outcome.terminal_state is not None else "TERMINAL"
+                )
                 self._emit(
                     "cancel", task_id,
-                    reason=view.state.value,
-                    detail="cancel no-op: task already in terminal state",
+                    reason=f"ALREADY_{prior}",
+                    detail=(
+                        f"cancel no-op: task already in terminal state {prior}; "
+                        f"state and capacity untouched"
+                    ),
                 )
                 return False
-            for step_id, unit_id, cost in occupied:
-                self._release(unit_id, cost, f"cancelled task={task_id} step={step_id}")
+            # 真变更：容量释放与状态流转在同一临界区，占用/释放严格配对。
+            for step_id, unit_id, cost in outcome.occupied:
+                self._release(
+                    unit_id, cost,
+                    f"user cancel task={task_id} step={step_id}",
+                )
+            waiting_pretty = [
+                f"{sid}({why or 'PURE_QUEUE'})" for sid, why in outcome.waiting_steps
+            ]
+            if outcome.occupied:
+                detail = (
+                    f"cancelled non-terminal task; released "
+                    f"{len(outcome.occupied)} in-flight step(s)"
+                )
+                if waiting_pretty:
+                    detail += (
+                        f"; also cancelled {len(waiting_pretty)} waiting "
+                        f"step(s) {waiting_pretty} (no capacity held)"
+                    )
+            else:
+                # 没占容量却确实变更：排队等容量 / 被抢占让位 / 离线重排队。
+                # 日志必须交代真实原因与实际影响，避免误报"无变化"。
+                detail = (
+                    f"cancelled non-terminal task with no in-flight capacity; "
+                    f"{len(waiting_pretty)} waiting step(s) {waiting_pretty} "
+                    f"cancelled (queued/preempted/offline-requeued; "
+                    f"no capacity to release)"
+                )
             self._emit(
                 "cancel", task_id,
                 reason="CANCELLED",
-                detail=f"released {len(occupied)} in-flight step(s)",
+                detail=detail,
             )
         # 取消可能释放了容量，其它任务得以推进
         self.kick()

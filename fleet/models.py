@@ -82,6 +82,9 @@ class RejectReason(str, Enum):
     # 在飞步骤被更高优先级步骤抢占而让位：不算失败、不消耗重试次数，
     # 容量释放后回到 PENDING 等待重新派发。
     PREEMPTED = "PREEMPTED"
+    # 在飞步骤因执行单元离线被回收：不算失败、不消耗重试次数，容量释放后
+    # 回到 PENDING，等待派发到其它在线单元。
+    UNIT_OFFLINE_REQUEUED = "UNIT_OFFLINE_REQUEUED"
 
 
 class FailureCode(str, Enum):
